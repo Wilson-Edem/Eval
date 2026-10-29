@@ -1,0 +1,240 @@
+
+name: ChatGPT Repository File Automation
+
+on:
+  repository_dispatch:
+    types:
+      - chatgpt_write_file
+
+permissions:
+  contents: write
+
+concurrency:
+  group: chatgpt-file-automation
+  cancel-in-progress: false
+
+jobs:
+  inspect-request:
+    name: Validate file request
+    runs-on: ubuntu-latest
+    outputs:
+      exists: ${{ steps.check.outputs.exists }}
+
+    steps:
+      - name: Check out main branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Validate path and check existing file
+        id: check
+        env:
+          FILE_PATH: ${{ github.event.client_payload.path }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path, PurePosixPath
+
+          root = Path.cwd().resolve()
+          raw = os.environ.get("FILE_PATH", "")
+
+          if not raw or "\x00" in raw or "\\" in raw:
+              raise SystemExit("Invalid repository-relative path.")
+
+          path = PurePosixPath(raw)
+
+          if (
+              path.is_absolute()
+              or ".." in path.parts
+              or str(path) != raw
+              or ".git" in path.parts
+          ):
+              raise SystemExit("Unsafe or non-normalized path.")
+
+          target = root.joinpath(*path.parts)
+
+          current = root
+          for part in path.parts:
+              current = current / part
+              if current.is_symlink():
+                  raise SystemExit("Symbolic links are not supported.")
+
+          resolved = target.resolve()
+          try:
+              resolved.relative_to(root)
+          except ValueError:
+              raise SystemExit("Path escapes the repository.")
+
+          if target.exists() and not target.is_file():
+              raise SystemExit("Target exists but is not a regular file.")
+
+          exists = target.is_file()
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"exists={'true' if exists else 'false'}\n")
+
+          print("Existing file detected." if exists else "New file requested.")
+          PY
+
+  create-new-file:
+    name: Create new file
+    needs: inspect-request
+    if: needs.inspect-request.outputs.exists == 'false'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out main branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Create file
+        env:
+          FILE_PATH: ${{ github.event.client_payload.path }}
+          FILE_CONTENT: ${{ github.event.client_payload.content }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path, PurePosixPath
+
+          root = Path.cwd().resolve()
+          raw = os.environ["FILE_PATH"]
+          path = PurePosixPath(raw)
+
+          if (
+              not raw
+              or path.is_absolute()
+              or ".." in path.parts
+              or str(path) != raw
+              or ".git" in path.parts
+              or "\\" in raw
+              or "\x00" in raw
+          ):
+              raise SystemExit("Unsafe file path.")
+
+          target = root.joinpath(*path.parts)
+
+          current = root
+          for part in path.parts:
+              current = current / part
+              if current.is_symlink():
+                  raise SystemExit("Symbolic links are not supported.")
+
+          try:
+              target.resolve().relative_to(root)
+          except ValueError:
+              raise SystemExit("Path escapes the repository.")
+
+          target.parent.mkdir(parents=True, exist_ok=True)
+
+          # Exclusive creation prevents overwriting a file that appeared
+          # after the inspection job completed.
+          with target.open("x", encoding="utf-8", newline="") as file:
+              file.write(os.environ.get("FILE_CONTENT", ""))
+
+          print(f"Created: {raw}")
+          PY
+
+      - name: Commit new file
+        env:
+          FILE_PATH: ${{ github.event.client_payload.path }}
+          COMMIT_MESSAGE: ${{ github.event.client_payload.message }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -- ":(literal)$FILE_PATH"
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "${COMMIT_MESSAGE:-Create file via automation}"
+          git push origin HEAD:main
+
+  overwrite-existing-file:
+    name: Approve and overwrite existing file
+    needs: inspect-request
+    if: needs.inspect-request.outputs.exists == 'true'
+    runs-on: ubuntu-latest
+
+    # Configure this environment with required reviewers in repository Settings.
+    environment:
+      name: overwrite-approval
+
+    steps:
+      - name: Check out main branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Validate and overwrite file
+        env:
+          FILE_PATH: ${{ github.event.client_payload.path }}
+          FILE_CONTENT: ${{ github.event.client_payload.content }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path, PurePosixPath
+
+          root = Path.cwd().resolve()
+          raw = os.environ.get("FILE_PATH", "")
+          path = PurePosixPath(raw)
+
+          if (
+              not raw
+              or path.is_absolute()
+              or ".." in path.parts
+              or str(path) != raw
+              or ".git" in path.parts
+              or "\\" in raw
+              or "\x00" in raw
+          ):
+              raise SystemExit("Unsafe file path.")
+
+          target = root.joinpath(*path.parts)
+
+          current = root
+          for part in path.parts:
+              current = current / part
+              if current.is_symlink():
+                  raise SystemExit("Symbolic links are not supported.")
+
+          try:
+              target.resolve().relative_to(root)
+          except ValueError:
+              raise SystemExit("Path escapes the repository.")
+
+          if not target.is_file():
+              raise SystemExit(
+                  "The original file no longer exists. "
+                  "Refusing to overwrite a changed target."
+              )
+
+          target.write_text(
+              os.environ.get("FILE_CONTENT", ""),
+              encoding="utf-8"
+          )
+
+          print(f"Overwrote approved target: {raw}")
+          PY
+
+      - name: Commit updated file
+        env:
+          FILE_PATH: ${{ github.event.client_payload.path }}
+          COMMIT_MESSAGE: ${{ github.event.client_payload.message }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -- ":(literal)$FILE_PATH"
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "${COMMIT_MESSAGE:-Update file via automation}"
+          git push origin HEAD:main
+          
